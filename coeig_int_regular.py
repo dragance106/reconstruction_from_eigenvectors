@@ -163,10 +163,10 @@ from int_eigenbasis import integer_orthogonal_eigenbasis
 
 
 def magma_graph_reader():
-    mats1 = read_magma_graphs_to_numpy_magma("coeig_int_regular/Wanless1.mgm")
-    mats2 = read_magma_graphs_to_numpy_magma("coeig_int_regular/Wanless2.mgm")
-    mats3 = read_magma_graphs_to_numpy_magma("coeig_int_regular/Wanless3.mgm")
-    mats4 = read_magma_graphs_to_numpy_magma("coeig_int_regular/Wanless4.mgm")
+    mats1 = read_magma_graphs_to_numpy_magma("coeig_int_regular/QIG1.mgm")
+    mats2 = read_magma_graphs_to_numpy_magma("coeig_int_regular/QIG2.mgm")
+    mats3 = read_magma_graphs_to_numpy_magma("coeig_int_regular/QIG3.mgm")
+    mats4 = read_magma_graphs_to_numpy_magma("coeig_int_regular/QIG4.mgm")
 
     counter = 0
     for A in mats1 + mats2 + mats3 + mats4:
