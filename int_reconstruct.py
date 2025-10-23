@@ -3,7 +3,9 @@ import sympy as sp
 import networkx as nx
 
 
-def int_reconstruct(n, x, permissible_values=[0, 1]):
+def int_reconstruct(n, x, permissible_values=[0, 1],
+                    skip_disconnected=False,
+                    skip_regular=False):
     """
     The method reconstructs all solutions to the system
     [X^=  O][Lambda] = [0]
@@ -71,9 +73,6 @@ def int_reconstruct(n, x, permissible_values=[0, 1]):
     s_rref, pivot_vars = sp.Matrix(s).rref()    # s_rref entries are sympy.Rational objects
     n_rref = sp.matrix2numpy(s_rref)
 
-    # denominators appearing in s_rref - we may need them during pivot scoring
-    n_denoms = sp.matrix2numpy(s_rref.applyfunc(lambda e: e.q))
-
     # sympy also has .echelon_form(with_pivots=True),
     # which gives the same pivot_vars,
     # but produces enormously large entries in the echelon form...
@@ -113,7 +112,6 @@ def int_reconstruct(n, x, permissible_values=[0, 1]):
     # use -n_rref[pivot_rows][free_vars] to compute pivots from the vector of free variables
     # pivot rows are always 0,...,num_pivots-1
     pivot_coeffs = -n_rref[0:num_pivots, free_vars]
-    denoms = n_denoms[0:num_pivots, free_vars]      # denoms now follow pivot_coeffs in indexing notation
 
     # pivot i depends on free variable j if pivot_coeffs[i, j]!=0
     # PAY ATTENTION: IT IS NOT pivot_coeffs[pivot_vars[i], free_vars[j]], BUT pivot_coeffs[i, j]!
@@ -291,20 +289,27 @@ def int_reconstruct(n, x, permissible_values=[0, 1]):
                 # Construct the graph using networkX
                 g = nx.from_numpy_array(A)
 
-                # Is it isomorphic to a previous graph corresponding to this matrix?
-                same_old = False
-                for previous in graphs:
-                    if nx.vf2pp_is_isomorphic(g, previous['graph']):
-                        same_old = True
-                        break
+                # Skipping disconnected graphs?
+                if not skip_disconnected or nx.is_connected(g):
 
-                if not same_old:
-                    # finally, we can add this as a new graph corresponding to the matrix x
-                    # keep track of other useful data as well
-                    graphs.append({'graph': g,
-                                   'adjacency': A,
-                                   'eigenvalues': eigs,
-                                   'eigenvectors': x})
+                    # Skipping regular graphs?
+                    degrees = A.sum(axis=1)
+                    if not skip_regular or not(np.allclose(degrees, degrees[0])):
+
+                        # Is it isomorphic to a previous graph corresponding to this matrix?
+                        same_old = False
+                        for previous in graphs:
+                            if nx.vf2pp_is_isomorphic(g, previous['graph']):
+                                same_old = True
+                                break
+
+                        if not same_old:
+                            # finally, we can add this as a new graph corresponding to the matrix x
+                            # keep track of other useful data as well
+                            graphs.append({'graph': g,
+                                           'adjacency': A,
+                                           'eigenvalues': eigs,
+                                           'eigenvectors': x})
 
             # backtrack to the previous node
             p = p-1

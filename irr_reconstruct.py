@@ -1,525 +1,323 @@
 import numpy as np
+from scipy.linalg import qr, lu_factor, lu_solve
+import itertools
+from typing import Iterator
 import networkx as nx
-from scipy.linalg import qr as _qr, svd as _svd
 
-# ---------------------------
-# Numeric RREF-like helpers
-# ---------------------------
-def numeric_rref_like(A, precision_digits=None, eps=None, rrqr_safety=10.0, reg_alpha=1.0):
+
+def select_invertible_submatrix_with_solver(A, cond_threshold=1e8, max_swaps=50, verbose=False):
     """
-    Numerically-stable RREF-like decomposition for possibly noisy/irrational data.
-
-    Returns dict with keys:
-      - 'rank': numeric rank r
-      - 'pivots': list of pivot column indices (in original column indexing)
-      - 'free': list of free column indices
-      - 'Rperm': r x n matrix representing [I_r | X] in original column order
-      - 'X': r x (n-r) matrix mapping free vars -> pivot coeffs (in pivot-first permuted order)
-      - 'perm': permutation array mapping new order to original indices
-      - 'inv_perm': inverse permutation
-      - 'tol_rank': rank tolerance used
-      - 'tol_entry': entry tolerance used (for "effectively zero")
-      - 'svals': singular values of A
-    """
-    A = np.asarray(A, dtype=float)
-    m, n = A.shape
-
-    # determine eps from precision_digits if not provided
-    if eps is None:
-        if precision_digits is not None:
-            eps = 10.0 ** (-precision_digits)
-        else:
-            eps = np.finfo(float).eps
-
-    # SVD for singular values and numeric rank
-    U, s, Wt = _svd(A, full_matrices=False)
-    s0 = s[0] if s.size > 0 else 0.0
-    tol_rank = max(m, n) * s0 * eps * rrqr_safety
-    r = int(np.sum(s > tol_rank))
-
-    # RRQR to pick stable pivot columns (column permutation 'piv')
-    if n == 0:
-        piv = np.array([], dtype=int)
-    else:
-        _, _, piv = _qr(A, pivoting=True, mode='economic')
-    piv = np.asarray(piv, dtype=int)
-
-    basic_cols = list(piv[:r])
-    free_cols = list(piv[r:])
-
-    # permutation that brings basic_cols first
-    perm = np.concatenate([basic_cols, free_cols]) if n > 0 else np.array([], dtype=int)
-    inv_perm = np.empty_like(perm)
-    inv_perm[perm] = np.arange(n)
-
-    # permuted matrix
-    Aperm = A[:, perm] if n > 0 else A.copy()
-
-    # partition
-    if r > 0:
-        A_B = Aperm[:, :r]
-        A_F = Aperm[:, r:]
-    else:
-        A_B = np.zeros((m, 0))
-        A_F = Aperm.copy()
-
-    # compute X = -A_B^+ A_F via Tikhonov-regularized pseudoinverse
-    if r == 0:
-        X = np.zeros((0, n))
-        Rperm = np.zeros((0, n), dtype=float)
-        tol_entry = 0.0
-    else:
-        Ub, sb, Wtb = _svd(A_B, full_matrices=False)
-        sb0 = sb[0] if sb.size > 0 else 0.0
-        # regularization parameter
-        lam = reg_alpha * max(A_B.shape) * sb0 * eps * rrqr_safety
-        # compute regularized pseudoinverse action
-        d = sb / (sb**2 + lam)           # shape (r,)
-        UtA_F = (Ub.T @ A_F)             # shape r x (n-r)
-        X_reg = - (Wtb.T * d) @ UtA_F    # shape r x (n-r)
-        X = X_reg
-
-        # RREF-like block in permuted order
-        rref_perm = np.hstack([np.eye(r), X])   # r x n
-        # Map back to original column order
-        Rperm = np.zeros((r, n), dtype=float)
-        Rperm[:, perm] = rref_perm
-
-        scale = max(1.0, np.max(np.abs(rref_perm)))
-        tol_entry = scale * eps * rrqr_safety
-
-    return {
-        'rank': r,
-        'pivots': basic_cols,
-        'free': free_cols,
-        'Rperm': Rperm,
-        'X': X,
-        'perm': perm,
-        'inv_perm': inv_perm,
-        'tol_rank': tol_rank,
-        'tol_entry': tol_entry,
-        'svals': s
-    }
-
-
-def decide_rref_zero_one(Rperm, tol_zero=None, tol_one=None, thr01=None):
-    """
-    Given Rperm (r x n) matrix (RREF-like) decide which entries are:
-      - effectively zero (abs <= tol_zero)
-      - effectively one  (abs(val-1) <= tol_one)
-      - ambiguous otherwise
-    thr01 can be used to set both tolerances at once.
-    Returns dict with boolean masks 'is_zero','is_one','is_ambig' and used tols.
-    """
-    R = np.asarray(Rperm, dtype=float)
-    if thr01 is not None:
-        tol_zero = tol_zero or thr01
-        tol_one = tol_one or thr01
-    if tol_zero is None:
-        eps = np.finfo(float).eps
-        scale = max(1.0, np.max(np.abs(R)))
-        tol_zero = scale * eps * 100.0
-    if tol_one is None:
-        eps = np.finfo(float).eps
-        scale = max(1.0, np.max(np.abs(R)))
-        tol_one = scale * eps * 100.0
-
-    is_zero = np.abs(R) <= tol_zero
-    is_one = np.abs(R - 1.0) <= tol_one
-    is_ambig = ~(is_zero | is_one)
-    return {
-        'is_zero': is_zero,
-        'is_one': is_one,
-        'is_ambig': is_ambig,
-        'tol_zero': tol_zero,
-        'tol_one': tol_one
-    }
-
-
-def decide_binary_from_expressions(expr_values,
-                                   thr01=None,
-                                   tol_rank=None,
-                                   eps=None,
-                                   rrqr_safety=10.0,
-                                   scale=None):
-    """
-    Decide binary assignment (0 / 1 / ambiguous) for expression values that
-    ideally should be 0 or 1. Uses scale-aware tolerances and optionally
-    incorporates tol_rank (numeric-rank tolerance) into the decision.
+    Select an invertible n×n submatrix B from a full-column-rank m×n matrix A (m>n),
+    using QR with column pivoting and optional max-volume refinement. Returns B,
+    selected row indices, its condition number, and a solver function solve_B(b).
 
     Parameters
     ----------
-    expr_values : array-like
-        Floating-point values (linear combinations of RREF entries).
-    thr01 : float or None
-        Optional user-controlled threshold. If provided it participates in
-        tolerance selection (max with other sources).
-    tol_rank : float or None
-        Numeric-rank tolerance (absolute). If provided it is used as a lower
-        bound on the zero/one tolerances (so that rank decisions are respected).
-    eps : float or None
-        Base machine/noise epsilon. If None, uses np.finfo(float).eps.
-    rrqr_safety : float
-        Safety multiplier for scale-based tolerance (default 10.0).
-    scale : float or None
-        Characteristic scale of the expressions (e.g. max abs of RREF block).
-        If None the function uses max(1.0, max(abs(expr_values))).
+    A : ndarray, shape (m, n)
+        Full column rank matrix (m>n).
+    cond_threshold : float, optional
+        If cond(B) > cond_threshold, attempt max-volume swaps to improve B.
+    max_swaps : int, optional
+        Maximum number of refinement swaps in the max-volume heuristic.
+    verbose : bool, optional
+        Print diagnostic messages.
 
     Returns
     -------
-    dict with keys:
-      'decision' : ndarray of shape expr_values -> values 0.0, 1.0, or np.nan
-      'is_zero'  : boolean mask where decided zero
-      'is_one'   : boolean mask where decided one
-      'is_ambig' : boolean mask where ambiguous
-      'tol_zero' : tolerance used for zero decision
-      'tol_one'  : tolerance used for one decision
-      'eps'      : eps used
-      'scale'    : scale used
+    B : ndarray, shape (n, n)
+        Chosen invertible submatrix of A.
+    row_idx : ndarray, shape (n,)
+        Indices of the rows of A used to form B (in Python 0-based indexing).
+    condB : float
+        Condition number of B (2-norm).
+    solve_B : callable
+        Function solve_B(b) that returns x solving B x = b. Accepts b of shape (n,) or (n, k).
     """
-    vals = np.asarray(expr_values, dtype=float)
-    if eps is None:
-        eps = np.finfo(float).eps
+    m, n = A.shape
+    if m <= n:
+        raise ValueError("Matrix must have more rows than columns (m > n).")
 
-    # determine scale if not provided
-    if scale is None:
-        scale = max(1.0, np.max(np.abs(vals))) if vals.size > 0 else 1.0
+    # Step 1: QR with column pivoting on A^T to choose candidate rows
+    Q, R, piv = qr(A.T, pivoting=True)
+    row_idx = np.array(piv[:n], dtype=int)
+    B = A[row_idx, :]
+    condB = np.linalg.cond(B)
+    if verbose:
+        print(f"[QRCP] initial cond(B) = {condB:.2e}")
 
-    # scale-based tolerance
-    tol_scale = scale * eps * rrqr_safety
+    # Step 2: Max-volume style refinement if needed
+    if condB > cond_threshold:
+        if verbose:
+            print("[maxvol] starting refinement...")
+        # We'll use SVD to form a stable pseudoinverse of B during iteration.
+        for swap_iter in range(max_swaps):
+            # Compute B_inv-like object via SVD (stable even if some s are small)
+            U, s, Vt = np.linalg.svd(B, full_matrices=False)
+            tol = np.finfo(float).eps * max(B.shape) * s[0]
+            s_inv = np.array([1 / si if si > tol else 0.0 for si in s])
+            B_inv = (Vt.T * s_inv) @ U.T  # pseudo-inverse
 
-    # determine tolerances: combine scale-based, numeric-rank, and user thr01
-    candidates = [tol_scale]
-    if thr01 is not None:
-        candidates.append(float(thr01))
-    if tol_rank is not None:
-        # tol_rank may be a small absolute value; include it directly
-        candidates.append(float(tol_rank))
+            # projection matrix P = A @ B_inv  (m x n)
+            P = A @ B_inv
+            absP = np.abs(P)
 
-    tol_zero = max(candidates)
-    tol_one = tol_zero  # symmetric choice; can be adapted if needed
+            # find largest magnitude entry of P
+            i, j = np.unravel_index(np.argmax(absP), absP.shape)
+            maxval = absP[i, j]
 
-    # decisions
-    is_zero = np.abs(vals) <= tol_zero
-    is_one = np.abs(vals - 1.0) <= tol_one
-    is_ambig = ~(is_zero | is_one)
+            # stopping criterion: locally maximal volume when no entry > 1
+            if maxval <= 1.0 + 1e-12:
+                if verbose:
+                    print(f"[maxvol] reached local max (iter {swap_iter}), max |P| = {maxval:.3g}")
+                break
 
-    # assemble decision array: prefer zero if both tests true (rare)
-    decision = np.full_like(vals, np.nan, dtype=float)
-    decision[is_zero] = 0.0
-    decision[is_one & (~is_zero)] = 1.0
+            # else swap row: bring row i into the j-th selected slot
+            if verbose:
+                print(f"[maxvol] swap iter {swap_iter + 1}: swapping in row {i} for slot {j} (|P|={maxval:.3g})")
+            row_idx[j] = i
+            B = A[row_idx, :]
+            condB = np.linalg.cond(B)
+            if verbose:
+                print(f"  cond(B) after swap = {condB:.2e}")
 
-    return {
-        'decision': decision,
-        'is_zero': is_zero,
-        'is_one': is_one,
-        'is_ambig': is_ambig,
-        'tol_zero': tol_zero,
-        'tol_one': tol_one,
-        'eps': eps,
-        'scale': scale
-    }
+            # stop early if we reached desired conditioning
+            if condB < cond_threshold:
+                if verbose:
+                    print("[maxvol] cond threshold reached; stopping refinement.")
+                break
+        else:
+            if verbose:
+                print("[maxvol] reached maximum swap iterations.")
 
-# ---------------------------
-# Main function (modified)
-# ---------------------------
-def irr_reconstruct(n, x, permissible_values=[0, 1],
-                    precision_digits=None, thr01=1e-6,
-                    rrqr_safety=10.0, reg_alpha=1.0):
+    # Final diagnostics
+    condB = np.linalg.cond(B)
+    if verbose:
+        print(f"[final] cond(B) = {condB:.2e}")
+
+    # Prepare solver using LU factorization (fast & stable for many solves)
+    try:
+        lu_and_piv = lu_factor(B)  # will raise if B is singular
+    except Exception as e:
+        # As a fallback, try SVD-based least-squares solve; but normally B is invertible.
+        raise RuntimeError("Failed to factor final B (may be singular).") from e
+
+    def solve_B(b):
+        """
+        Solve B x = b for x. Accepts b shape (n,) or (n, k).
+        Returns x with shape (n,) or (n, k) respectively.
+        """
+        b_arr = np.asarray(b)
+        # allow column vector shapes
+        if b_arr.ndim == 1:
+            if b_arr.shape[0] != n:
+                raise ValueError(f"b must have length {n} for B x = b.")
+            return lu_solve(lu_and_piv, b_arr)
+        elif b_arr.ndim == 2:
+            if b_arr.shape[0] != n:
+                raise ValueError(f"b must have {n} rows for B x = b (got {b_arr.shape[0]}).")
+            return lu_solve(lu_and_piv, b_arr)
+        else:
+            raise ValueError("b must be a 1D or 2D array.")
+
+    return B, row_idx, condB, solve_B
+
+
+def generate_b_vectors(rows, n: int, permissible_values=[0,1]) -> Iterator[np.ndarray]:
     """
-    Reconstruct solutions for adjacency (permissible_values default [0,1])
-    from (possibly irrational or noisy) eigenvector matrix x.
+    Generate all n-dimensional vectors b (dtype int, entries 0/1) such that:
+      - b[i] == 0 whenever rows[i] < n (forced zero)
+      - for positions with rows[i] >= n, b[i] iterates through all 0/1 combinations
 
-    New optional arguments:
-      - precision_digits: number of decimal digits of precision in x (used to set eps)
-      - thr01: threshold for deciding values to be close to 0 or 1
-      - rrqr_safety, reg_alpha: numeric routine tuning parameters
+    Parameters
+    ----------
+    rows : array-like of shape (n,)
+        Row indices returned by your selection routine (0-based integers).
+    n : int
+        The threshold/number of columns (same `n` as matrix A has columns).
+
+    Yields
+    ------
+    b : np.ndarray of shape (n,), dtype=int
+        A vector of 0/1 values meeting the rule above.
     """
+    rows = np.asarray(rows, dtype=int)
+    if rows.shape[0] != n:
+        raise ValueError("rows must have length n")
 
-    # initialize results list
+    # positions that are free to be 0/1
+    var_positions = [i for i, r in enumerate(rows) if r >= n]
+    k = len(var_positions)
+
+    # base vector with forced zeros
+    base = np.zeros(n, dtype=int)
+
+    # iterate over all 2^k assignments
+    for bits in itertools.product(permissible_values, repeat=k):
+        b = base.copy()
+        for pos, bit in zip(var_positions, bits):
+            b[pos] = bit
+        yield b
+
+
+def binary_mask_real(A, tol=1e-8):
+    """
+    Return a boolean mask of the same shape as A: True where entry is close to 0 or 1.
+    Assumes A is real-valued. Uses absolute tolerance tol.
+    """
+    A = np.asarray(A)
+    return np.isclose(A, 0, atol=tol) | np.isclose(A, 1, atol=tol)
+
+
+def is_binary_matrix_real(A, tol=1e-8, repair=False):
+    """
+    Check whether all entries of a real array A belong to {0,1} up to absolute tolerance tol.
+
+    Parameters
+    ----------
+    A : array-like (real)
+        Input array (any shape). Must be real-valued.
+    tol : float
+        Absolute tolerance for closeness to 0 or 1.
+    repair : bool
+        If True, and all entries are within tol of {0,1}, return a repaired integer
+        array (dtype=int) with values rounded to 0/1. If there are entries outside tol,
+        raise ValueError.
+
+    Returns
+    -------
+    all_binary : bool
+        True if every entry is within tol of 0 or 1.
+    (optional) bad_idx : ndarray of shape (k, ndim)
+        Indices of offending entries (only if return_bad_indices True).
+    (optional) repaired : ndarray
+        Integer array (0/1) when repair=True and repair succeeded.
+    """
+    A = np.asarray(A)
+
+    mask = binary_mask_real(A, tol=tol)
+    all_ok = bool(mask.all())
+    out = (all_ok,)
+
+    if repair:
+        # choose closest of {0,1} for each entry
+        repaired = (np.abs(A - 1) < np.abs(A - 0)).astype(int)
+        out += (repaired,)
+
+    if len(out) == 1:
+        return out[0]
+    else:
+        return out
+
+
+def multiset_equal_sort(a, b, *, atol=1e-8, rtol=0.0, equal_nan=False):
+    """
+    Return True if arrays a and b contain the same elements (as a multiset),
+    up to rounding error, and possibly in different orders.
+    Uses sorting + elementwise comparison with np.allclose.
+
+    Parameters
+    ----------
+    a, b : array-like
+        Input arrays (any shape). They are flattened before comparison.
+    atol : float
+        Absolute tolerance for closeness.
+    rtol : float
+        Relative tolerance for closeness (passed to np.allclose).
+    equal_nan : bool
+        If True, treat NaNs as equal.
+
+    Returns
+    -------
+    bool
+    """
+    a = np.asarray(a).ravel()
+    b = np.asarray(b).ravel()
+    if a.size != b.size:
+        return False
+    # stable numeric sort
+    asort = np.sort(a)
+    bsort = np.sort(b)
+    return np.allclose(asort, bsort, atol=atol, rtol=rtol, equal_nan=equal_nan)
+
+
+def irr_reconstruct(n, x, permissible_values=[0,1],
+                    thr01=1e-6,
+                    skip_disconnected=False,
+                    skip_regular=False):
+    # auxiliary command to print full numpy matrices without truncation...
+    # np.set_printoptions(threshold=np.inf)
+
+    # initialize empty list of graph (dictionaries) found for this matrix
     graphs = []
 
-    # norms (squared norms of eigenvectors) - use float
+    # a row of squared norms of eigenvectors - we'll need that to reconstruct eigenvalues
     norms = np.array([np.dot(x[0:n, i], x[0:n, i]) for i in range(n)], dtype=float)
 
-    # create matrix of the linear system: size (n + n_over_2) x (n + n_over_2)
-    n_over_2 = n * (n - 1) // 2
-    s = np.zeros((n + n_over_2, n + n_over_2), dtype=float)
+    # create matrix of the linear system
+    # [X^=]
+    # [X^<]
+    n_over_2 = n*(n-1)//2
+    s = np.zeros((n + n_over_2, n), dtype=float)
 
-    # upper-left block X^= : squared entries (columns are eigenvectors)
-    # x is expected with eigenvectors as columns: x[0:n, i] is i-th eigenvector
-    s[0:n, 0:n] = (x**2)[0:n, 0:n]
+    # X^= up
+    s[0:n, 0:n] = x**2
 
-    # X^< block: products x_{i,k} x_{i,l} for k<l
+    # products x_{i,k} x_{i,l} in the first n columns for each k<l
+    # here x_{i,k} is the k-th entry of eigenvector x_i
+    # since the eigenvectors are taken as columns of the matrix x,
+    # x_{i,k} is actually x[k, i] in Python terminology
+    # the same ordering will be respected later to create an adjacency matrix from the free and pivot variables
+
+    # X^< down
     row_counter = n
     for k in range(n):
-        for l in range(k + 1, n):
+        for l in range(k+1, n):
             s[row_counter, 0:n] = x[k, 0:n] * x[l, 0:n]
-            # -I on the right block
-            s[row_counter, row_counter] = -1.0
-            row_counter += 1
 
-    # Use numeric RREF-like routine instead of sympy.rref (works with floats/noisy input)
-    res = numeric_rref_like(s, precision_digits=precision_digits,
-                            rrqr_safety=rrqr_safety, reg_alpha=reg_alpha)
+            # move to the next row
+            row_counter = row_counter + 1
 
-    n_rref = res['Rperm']   # shape (num_pivots, total_vars) in original column order
-    tol_entry = res['tol_entry']
-    tol_rank = res['tol_rank']
+    # system matrix s has full rank - find its invertible submatrix
+    B, rows, condB, solve_B = select_invertible_submatrix_with_solver(s, cond_threshold=1e6, verbose=False)
 
-    pivot_vars = np.array(tuple(res['pivots']))
-    num_pivots = res['rank']
+    # now go through all possible choices for adjacency matrix entries
+    # that correspond to selected rows whose indices are at least n
+    # (the first n rows correspond to diagonal entries of adjacency matrix, which are all 0)
+    for b in generate_b_vectors(rows, n, permissible_values=permissible_values):
+        L = solve_B(b)
+        A = x @ np.diag(L) @ x.T
+        eigs = L * norms
 
-    # Determine a scale for RREF-related expressions (used below in decisions)
-    try:
-        scale_R = max(1.0, np.max(np.abs(n_rref)))
-    except Exception:
-        scale_R = 1.0
+        # check that A represents adjacency matrix
+        ok_A, A_repaired = is_binary_matrix_real(A, tol=thr01, repair=True)
 
-    # Determine free variables as those not in pivot_vars
-    free_vars = np.setdiff1d(np.arange(n_over_2+n), pivot_vars)
-    num_free_vars = len(free_vars)
+        if ok_A:
+            # check also that all the diagonal entries are zeros - don't want no loops!
+            if bool(np.all(np.abs(np.diag(A)) <= thr01)):
 
-    # If no pivots found (degenerate), return empty list early
-    if num_pivots == 0:
-        return graphs
+                # Construct the graph using networkX
+                g = nx.from_numpy_array(A_repaired)
 
-    # Extract pivot_coeffs: coefficients mapping free vars to pivot vars
-    pivot_coeffs = n_rref[0:num_pivots, free_vars]  # shape (num_pivots, num_free_vars)
-    # MAYBE WE DO NOT NEED MINUS SIGN IN FRONT OF n_rref IN FLOATING ARITHMETIC?
+                # Skipping disconnected graphs?
+                if not skip_disconnected or nx.is_connected(g):
 
-    # Treat tiny coefficients as zero using tol_entry
-    small_mask = np.abs(pivot_coeffs) <= tol_entry
-    pivot_coeffs[small_mask] = 0.0
+                    # Skipping regular graphs?
+                    degrees = A_repaired.sum(axis=1)
+                    if not skip_regular or not(np.allclose(degrees, degrees[0], atol=thr01)):
 
-    # pivot dependency counts (number of free vars that pivot depends on)
-    unmarked_depends = np.count_nonzero(pivot_coeffs != 0.0, axis=1)
+                        # Is it isomorphic to a previous graph corresponding to this matrix?
+                        same_old = False
+                        for previous in graphs:
+                            if nx.vf2pp_is_isomorphic(g, previous['graph']):
+                                same_old = True
+                                break
 
-    # Set unmarked_depends for first n pivots (eigenvalues) to zero -- they are fixed
-    unmarked_depends[0:n] = 0
-
-    # mark pivots that already depend on no free variable with phase -1
-    pivot_var_phase = np.zeros(num_pivots, dtype=int)
-    pivot_var_phase[np.where(unmarked_depends == 0)] = -1
-
-    num_pivots_unmarked = np.count_nonzero(pivot_var_phase != -1)
-
-    # free variable phases and pivot phases arrays
-    free_var_phase = np.zeros(num_free_vars, dtype=int)
-
-    current_phase = 1
-    # main phase assignment loop
-    while num_pivots_unmarked > 0:
-        # scoring: pick unmarked pivot with smallest unmarked_depends
-        select_pivot = np.where(pivot_var_phase == 0, unmarked_depends, np.inf).argmin()
-
-        # mark unmarked free vars that this pivot depends on
-        for j in range(num_free_vars):
-            if free_var_phase[j] == 0:
-                if pivot_coeffs[select_pivot, j] != 0.0:
-                    free_var_phase[j] = current_phase
-
-                    # update unmarked_depends
-                    for i in range(num_pivots):
-                        if pivot_var_phase[i] == 0 and pivot_coeffs[i, j] != 0.0:
-                            unmarked_depends[i] -= 1
-
-        # assign current phase to pivot vars that now have unmarked_depends == 0
-        for i in range(num_pivots):
-            if pivot_var_phase[i] == 0 and unmarked_depends[i] == 0:
-                pivot_var_phase[i] = current_phase
-                num_pivots_unmarked -= 1
-
-        current_phase += 1
-
-    total_phases = current_phase
-
-    # Prepare phased ordering arrays
-    phased_pivot_vars = np.zeros(num_pivots, dtype=int)
-    phased_free_vars = np.zeros(num_free_vars, dtype=int)
-
-    phased_pivot_var_limit = np.zeros(total_phases, dtype=int)
-    phased_free_var_limit = np.zeros(total_phases, dtype=int)
-
-    current_pivot = 0
-    current_free = 0
-    for p in range(1, total_phases):
-        for i in range(num_pivots):
-            if pivot_var_phase[i] == p:
-                phased_pivot_vars[current_pivot] = i
-                current_pivot += 1
-
-        phased_pivot_var_limit[p] = current_pivot
-
-        for j in range(num_free_vars):
-            if free_var_phase[j] == p:
-                phased_free_vars[current_free] = j
-                current_free += 1
-
-        phased_free_var_limit[p] = current_free
-
-    # add unreachable pivots (phase -1) at the end
-    for i in range(num_pivots):
-        if pivot_var_phase[i] == -1:
-            phased_pivot_vars[current_pivot] = i
-            current_pivot += 1
-
-    # free variables always have a nonzero entry in their column,
-    # so they will always obtain a positive phase
-
-    # reorder pivot_coeffs according to phased orders
-    phased_pivot_coeffs = pivot_coeffs[phased_pivot_vars, :]
-    phased_pivot_coeffs = phased_pivot_coeffs[:, phased_free_vars]
-
-    # Setup enumeration data structures
-    phase_len = np.zeros(total_phases, dtype=int)
-    max_phase_value = np.zeros(total_phases, dtype=int)
-
-    base = len(permissible_values)
-    for p in range(1, total_phases):
-        phase_len[p] = phased_free_var_limit[p] - phased_free_var_limit[p - 1]
-        max_phase_value[p] = base ** phase_len[p] - 1
-
-    phase_value = np.zeros(total_phases + 1, dtype=int)
-    phased_free_var_value = np.zeros(num_free_vars, dtype=int)  # free variables correspond to edges
-
-    # enumeration / backtracking
-    p = 1
-    phase_value[p] = 0
-    go_back = False
-    total_nodes = 1
-
-    # Precompute permissible values as numpy array
-    perm_vals = np.array(permissible_values, dtype=float)
-
-    while True:
-        if p == 0:
-            break
-
-        if p == total_phases:
-            # found a complete assignment of free variables
-            # compute pivot values for this assignment
-            phased_pivot_var_value = phased_pivot_coeffs @ phased_free_var_value
-
-            # reconstruct full_solution vector (size n + n_over_2)
-            full_solution = np.zeros(n + n_over_2, dtype=float)
-
-            for i in range(num_pivots):
-                full_solution[pivot_vars[phased_pivot_vars[i]]] = phased_pivot_var_value[i]
-
-            for j in range(num_free_vars):
-                full_solution[free_vars[phased_free_vars[j]]] = phased_free_var_value[j]
-
-            # reconstruct eigenvalues (first n variables scaled by norms)
-            eigs = np.zeros(n, dtype=float)
-            eigs[0:n] = full_solution[0:n] * norms[0:n]
-
-            # reconstruct adjacency by mapping free/pivot variables to nearest permissible values
-            A = np.zeros((n, n), dtype=int)
-            entry_counter = n
-            ambiguous_flag = False
-            for k in range(n):
-                for l in range(k + 1, n):
-                    val = full_solution[entry_counter]
-                    # decide using scale-aware routine: returns 0/1/NaN
-                    dec = decide_binary_from_expressions([val],
-                                                         thr01=thr01,
-                                                         tol_rank=tol_rank,
-                                                         eps=None,
-                                                         rrqr_safety=rrqr_safety,
-                                                         scale=scale_R)
-                    chosen = dec['decision'][0]
-                    if np.isnan(chosen):
-                        ambiguous_flag = True
-                        break
-                    # chosen is 0.0 or 1.0
-                    A[k, l] = int(chosen)
-                    A[l, k] = int(chosen)
-                    entry_counter += 1
-                if ambiguous_flag:
-                    break
-
-            if ambiguous_flag:
-                # reject this candidate and backtrack
-                p = p - 1
-                go_back = True
-                continue
-
-            # Construct graph
-            g = nx.from_numpy_array(A)
-
-            # check isomorphism to previously found graphs
-            same_old = False
-            for previous in graphs:
-                if nx.vf2pp_is_isomorphic(g, previous['graph']):
-                    same_old = True
-                    break
-
-            if not same_old:
-                graphs.append({'graph': g,
-                               'adjacency': A,
-                               'eigenvalues': eigs,
-                               'eigenvectors': x})
-
-            # backtrack
-            p = p - 1
-            go_back = True
-            continue
-
-        if go_back:
-            phase_value[p] += 1
-            if phase_value[p] > max_phase_value[p]:
-                p -= 1
-                go_back = True
-            else:
-                go_back = False
-                total_nodes += 1
-        else:
-            # enter new node: decode phase_value into digits base 'base'
-            s_val = f'{np.base_repr(phase_value[p], base=base)}'.zfill(phase_len[p])
-            for i in range(phase_len[p]):
-                phased_free_var_value[phased_free_var_limit[p - 1] + i] = permissible_values[int(s_val[i])]
-
-            # compute pivot values for this phase (only those pivots in the phase)
-            start_p = phased_pivot_var_limit[p - 1]
-            end_p = phased_pivot_var_limit[p]
-            num_piv_in_phase = end_p - start_p
-            if num_piv_in_phase > 0:
-                rows = phased_pivot_coeffs[start_p:end_p, 0:phased_free_var_limit[p]]
-                cols = phased_free_var_value[0:phased_free_var_limit[p]]
-                phased_pivot_var_value = rows @ cols
-            else:
-                phased_pivot_var_value = np.array([], dtype=float)
-
-            # Decide using scale-aware routine whether pivot values are close to permissible values
-            if phased_pivot_var_value.size > 0:
-                dec = decide_binary_from_expressions(phased_pivot_var_value,
-                                                     thr01=thr01,
-                                                     tol_rank=tol_rank,
-                                                     eps=None,
-                                                     rrqr_safety=rrqr_safety,
-                                                     scale=scale_R)
-                # node acceptable if none ambiguous and all decisions are in permissible set
-                if np.any(dec['is_ambig']):
-                    node_acceptable = False
-                else:
-                    # ensure that the decided values are among permissible_values (they should be 0/1)
-                    node_acceptable = np.all(np.isin(dec['decision'], perm_vals))
-            else:
-                node_acceptable = True
-
-            if node_acceptable:
-                p += 1
-                phase_value[p] = 0
-                go_back = False
-                total_nodes += 1
-            else:
-                phase_value[p] += 1
-                if phase_value[p] > max_phase_value[p]:
-                    p -= 1
-                    go_back = True
-                else:
-                    go_back = False
-                    total_nodes += 1
+                        if not same_old:
+                            # finally, we can add this as a new graph corresponding to the matrix x
+                            # keep track of other useful data as well
+                            graphs.append({'graph': g,
+                                           'adjacency': A_repaired,
+                                           'eigenvalues': eigs,
+                                           'eigenvectors': x})
 
     return graphs

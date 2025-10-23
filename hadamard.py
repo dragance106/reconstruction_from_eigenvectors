@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import time
 
 from int_reconstruct import int_reconstruct
-from irr_reconstruct import irr_reconstruct
+from irr_reconstruct_old import irr_reconstruct
 
 
 # decode Hadamard matrix equivalence class representative from a line
@@ -64,20 +64,17 @@ def process_all_choices(params):
     c = x_copy[:, column]
     x_copy *= c[:, None]
 
-    # graphs = A_reconstruct_integer(n, x_copy, permissible_values)
     graphs = irr_reconstruct(n, x_copy, permissible_values)
-    # graphs = A_reconstruct_irrational(n, x_copy, permissible_values,
-    #                                   precision_digits=4, thr01=1e-2,
-    #                                   rrqr_safety=100.0, reg_alpha=1.0)
 
     return graphs
 
 
 if __name__=="__main__":
     tic = time.time()
+    np.set_printoptions(threshold=np.inf)
 
     # number of vertices is one of: 4, 8, 12, 16, 20, 24, 28, 32
-    n = 24
+    n = 16
 
     # permissible values for adjacency matrix entries are
     # either [0, 1] for simple graphs or [-1, 0, 1] for signed graphs
