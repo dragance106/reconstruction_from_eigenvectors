@@ -4,13 +4,15 @@ import networkx as nx
 
 from irr_reconstruct import irr_reconstruct
 
-for n in range(4, 21):
+for n in [30, 31, 32, 33]:
     A = np.zeros((n,n),dtype=int)
     for i in range(n-1):
         A[i,i+1] = 1
         A[i+1,i] = 1
 
     _, x = np.linalg.eigh(A)
+
+    print(f'processing path_{n}')
 
     graphs = irr_reconstruct(n, x, [0, 1],
                              skip_disconnected=True,

@@ -1,125 +1,195 @@
 import numpy as np
-from scipy.linalg import qr, lu_factor, lu_solve
+from scipy.linalg import qr, lu_factor, lu_solve, svd
 import itertools
-from typing import Iterator
+from typing import Iterator, List, Optional, Tuple, Union
 import networkx as nx
 
 
-def select_invertible_submatrix_with_solver(A, cond_threshold=1e8, max_swaps=50, verbose=False):
+def select_invertible_submatrix_maximize_min_singular(
+    A: np.ndarray,
+    preferred_rows: Optional[List[int]] = None,
+    min_sigma_threshold: float = 1e-12,
+    max_swaps: int = 200,
+    verbose: bool = False
+) -> Tuple[np.ndarray, np.ndarray, float, callable]:
     """
-    Select an invertible n×n submatrix B from a full-column-rank m×n matrix A (m>n),
-    using QR with column pivoting and optional max-volume refinement. Returns B,
-    selected row indices, its condition number, and a solver function solve_B(b).
+    Select an invertible n x n submatrix B from full-column-rank A (m>n),
+    prioritizing inclusion of preferred_rows while maximizing (or preserving)
+    the smallest singular value sigma_min(B) for numerical stability.
 
-    Parameters
-    ----------
-    A : ndarray, shape (m, n)
-        Full column rank matrix (m>n).
-    cond_threshold : float, optional
-        If cond(B) > cond_threshold, attempt max-volume swaps to improve B.
-    max_swaps : int, optional
-        Maximum number of refinement swaps in the max-volume heuristic.
-    verbose : bool, optional
-        Print diagnostic messages.
+    Returns:
+      B:    (n,n) ndarray, the selected submatrix
+      row_idx: (n,) ndarray, indices of rows chosen from A
+      sigma_min: float, smallest singular value of B
+      solve_B: callable to solve B x = b (uses LU factorization)
 
-    Returns
-    -------
-    B : ndarray, shape (n, n)
-        Chosen invertible submatrix of A.
-    row_idx : ndarray, shape (n,)
-        Indices of the rows of A used to form B (in Python 0-based indexing).
-    condB : float
-        Condition number of B (2-norm).
-    solve_B : callable
-        Function solve_B(b) that returns x solving B x = b. Accepts b of shape (n,) or (n, k).
+    Parameters:
+      A: (m,n) with m > n and full column rank
+      preferred_rows: list of row indices to prefer (defaults to [0..n-1])
+      min_sigma_threshold: minimal acceptable sigma_min; if sigma_min < this,
+                           the algorithm still returns best found but prints
+                           warning (if verbose).
+      max_swaps: max number of single-row swap attempts in greedy phase
+      verbose: print diagnostics
     """
+    A = np.asarray(A, dtype=float)
     m, n = A.shape
     if m <= n:
-        raise ValueError("Matrix must have more rows than columns (m > n).")
+        raise ValueError("A must have more rows than columns (m > n).")
 
-    # Step 1: QR with column pivoting on A^T to choose candidate rows
+    if preferred_rows is None:
+        preferred_set = set(range(n))
+    else:
+        preferred_set = set(int(r) for r in preferred_rows)
+
+    # Step 1: initial selection by QR with column pivoting on A^T
     Q, R, piv = qr(A.T, pivoting=True)
     row_idx = np.array(piv[:n], dtype=int)
     B = A[row_idx, :]
-    condB = np.linalg.cond(B)
+
+    # function to compute smallest singular value robustly
+    def sigma_min_of(mat: np.ndarray) -> float:
+        # For small n this is fine; for larger n consider using specialized routine.
+        s = svd(mat, compute_uv=False)
+        return float(np.min(s)) if s.size > 0 else 0.0
+
+    sigma_min = sigma_min_of(B)
     if verbose:
-        print(f"[QRCP] initial cond(B) = {condB:.2e}")
+        print(f"[init] selected rows {row_idx.tolist()}; sigma_min = {sigma_min:.3e}; preferred_count = {sum(1 for r in row_idx if r in preferred_set)}/{n}")
 
-    # Step 2: Max-volume style refinement if needed
-    if condB > cond_threshold:
-        if verbose:
-            print("[maxvol] starting refinement...")
-        # We'll use SVD to form a stable pseudoinverse of B during iteration.
-        for swap_iter in range(max_swaps):
-            # Compute B_inv-like object via SVD (stable even if some s are small)
-            U, s, Vt = np.linalg.svd(B, full_matrices=False)
-            tol = np.finfo(float).eps * max(B.shape) * s[0]
-            s_inv = np.array([1 / si if si > tol else 0.0 for si in s])
-            B_inv = (Vt.T * s_inv) @ U.T  # pseudo-inverse
+    # Helper: count preferred rows selected
+    def preferred_count(sel_idx):
+        return sum(1 for r in sel_idx if r in preferred_set)
 
-            # projection matrix P = A @ B_inv  (m x n)
-            P = A @ B_inv
-            absP = np.abs(P)
+    # Greedy single-row swaps: try to increase preferred rows without decreasing sigma_min
+    swaps = 0
+    improved = True
+    while improved and swaps < max_swaps:
+        improved = False
+        current_pref = preferred_count(row_idx)
 
-            # find largest magnitude entry of P
-            i, j = np.unravel_index(np.argmax(absP), absP.shape)
-            maxval = absP[i, j]
+        # candidate preferred rows not currently selected
+        not_sel_pref = [r for r in preferred_set if r not in row_idx]
+        # positions in row_idx that are non-preferred (candidates to replace)
+        sel_nonpref_pos = [j for j, r in enumerate(row_idx) if r not in preferred_set]
 
-            # stopping criterion: locally maximal volume when no entry > 1
-            if maxval <= 1.0 + 1e-12:
-                if verbose:
-                    print(f"[maxvol] reached local max (iter {swap_iter}), max |P| = {maxval:.3g}")
-                break
+        if not not_sel_pref or not sel_nonpref_pos:
+            break  # nothing to do
 
-            # else swap row: bring row i into the j-th selected slot
-            if verbose:
-                print(f"[maxvol] swap iter {swap_iter + 1}: swapping in row {i} for slot {j} (|P|={maxval:.3g})")
-            row_idx[j] = i
+        best_candidate = None  # (sigma_new, j, p, new_row_idx)
+        for p in not_sel_pref:
+            for j in sel_nonpref_pos:
+                trial_idx = row_idx.copy()
+                trial_idx[j] = p
+                B_trial = A[trial_idx, :]
+                try:
+                    sigma_trial = sigma_min_of(B_trial)
+                except Exception:
+                    sigma_trial = -1.0
+                # accept only if sigma_trial >= sigma_min (no degradation)
+                if sigma_trial >= sigma_min - 1e-18:
+                    # prefer increases in preferred_count first, then larger sigma
+                    new_pref = preferred_count(trial_idx)
+                    if new_pref > current_pref:
+                        # immediate best: prioritize any swap that increases preferred_count
+                        if best_candidate is None or (new_pref > best_candidate[4]) or (sigma_trial > best_candidate[0]):
+                            best_candidate = (sigma_trial, j, p, trial_idx, new_pref)
+                    else:
+                        # if no increase in pref_count we still may pick sigma increase
+                        if best_candidate is None:
+                            best_candidate = (sigma_trial, j, p, trial_idx, new_pref)
+                        else:
+                            # keep the one with larger sigma_trial
+                            if sigma_trial > best_candidate[0]:
+                                best_candidate = (sigma_trial, j, p, trial_idx, new_pref)
+
+        if best_candidate is not None:
+            sigma_new, slot_j, pref_row, new_idx, new_pref = best_candidate
+            # Apply swap
+            row_idx = new_idx
             B = A[row_idx, :]
-            condB = np.linalg.cond(B)
+            sigma_min = sigma_new
+            swaps += 1
+            improved = True
             if verbose:
-                print(f"  cond(B) after swap = {condB:.2e}")
-
-            # stop early if we reached desired conditioning
-            if condB < cond_threshold:
-                if verbose:
-                    print("[maxvol] cond threshold reached; stopping refinement.")
-                break
+                print(f"[greedy-swap #{swaps}] inserted preferred row {pref_row} into slot {slot_j}; sigma_min={sigma_min:.3e}; preferred_count={new_pref}/{n}")
         else:
+            # nothing acceptable found that does not degrade sigma_min
+            break
+
+    # Optional max-volume-style refinement but only accept swaps that increase sigma_min
+    # (Compute projection via pseudo-inverse and attempt to swap the max entry as before,
+    #  but only if sigma_min improves.)
+    if verbose:
+        print("[maxvol-like] attempting refinement that increases sigma_min (no degradation allowed).")
+    maxvol_swaps = 0
+    while maxvol_swaps < max_swaps:
+        # compute SVD-based pseudo-inverse of current B
+        U, svals, Vt = np.linalg.svd(B, full_matrices=False)
+        tol = np.finfo(float).eps * max(B.shape) * (svals[0] if svals.size else 0.0)
+        s_inv = np.array([1.0/s if s > tol else 0.0 for s in svals])
+        B_pinv = (Vt.T * s_inv) @ U.T                 # pseudo-inverse (n x n)
+        P = A @ B_pinv                                # (m x n)
+        absP = np.abs(P)
+        i, j = np.unravel_index(np.argmax(absP), absP.shape)
+        maxval = absP[i, j]
+        if maxval <= 1.0 + 1e-12:
             if verbose:
-                print("[maxvol] reached maximum swap iterations.")
+                print(f"[maxvol-like] local optimum (max|P|={maxval:.3g}).")
+            break
+
+        # candidate swap: bring row i into slot j
+        candidate_idx = row_idx.copy()
+        candidate_idx[j] = int(i)
+        B_candidate = A[candidate_idx, :]
+        try:
+            sigma_candidate = sigma_min_of(B_candidate)
+        except Exception:
+            sigma_candidate = -1.0
+
+        # Accept only if sigma_candidate > sigma_min (strict improvement)
+        if sigma_candidate > sigma_min + 1e-18:
+            row_idx = candidate_idx
+            B = A[row_idx, :]
+            sigma_min = sigma_candidate
+            maxvol_swaps += 1
+            if verbose:
+                print(f"[maxvol-like swap #{maxvol_swaps}] swapped in row {i} for slot {j}; sigma_min improved to {sigma_min:.3e}; preferred_count={preferred_count(row_idx)}/{n}")
+            # continue refinement
+            continue
+        else:
+            # no improvement in sigma_min possible via this max-entry swap
+            if verbose:
+                print(f"[maxvol-like] proposed swap (row {i}->slot {j}) does not improve sigma_min ({sigma_candidate:.3e} <= {sigma_min:.3e}); stopping refinement.")
+            break
 
     # Final diagnostics
-    condB = np.linalg.cond(B)
+    final_pref = preferred_count(row_idx)
     if verbose:
-        print(f"[final] cond(B) = {condB:.2e}")
+        print(f"[final] sigma_min = {sigma_min:.3e}; preferred_count = {final_pref}/{n}; selected rows: {row_idx.tolist()}")
+    if sigma_min < min_sigma_threshold and verbose:
+        print(f"[warning] sigma_min ({sigma_min:.3e}) below threshold ({min_sigma_threshold:.3e}).")
 
-    # Prepare solver using LU factorization (fast & stable for many solves)
+    # Prepare solver: using LU (works well when B is well conditioned)
     try:
-        lu_and_piv = lu_factor(B)  # will raise if B is singular
+        lu_and_piv = lu_factor(B)
     except Exception as e:
-        # As a fallback, try SVD-based least-squares solve; but normally B is invertible.
-        raise RuntimeError("Failed to factor final B (may be singular).") from e
+        raise RuntimeError("Final B appears singular or LU failed.") from e
 
-    def solve_B(b):
-        """
-        Solve B x = b for x. Accepts b shape (n,) or (n, k).
-        Returns x with shape (n,) or (n, k) respectively.
-        """
+    def solve_B(b: Union[np.ndarray, List[float]]):
         b_arr = np.asarray(b)
-        # allow column vector shapes
         if b_arr.ndim == 1:
             if b_arr.shape[0] != n:
-                raise ValueError(f"b must have length {n} for B x = b.")
+                raise ValueError(f"b must have length {n}.")
             return lu_solve(lu_and_piv, b_arr)
         elif b_arr.ndim == 2:
             if b_arr.shape[0] != n:
-                raise ValueError(f"b must have {n} rows for B x = b (got {b_arr.shape[0]}).")
+                raise ValueError(f"b must have {n} rows.")
             return lu_solve(lu_and_piv, b_arr)
         else:
-            raise ValueError("b must be a 1D or 2D array.")
+            raise ValueError("b must be 1D or 2D array.")
 
-    return B, row_idx, condB, solve_B
+    return B, row_idx, float(sigma_min), solve_B
 
 
 def generate_b_vectors(rows, n: int, permissible_values=[0,1]) -> Iterator[np.ndarray]:
@@ -278,7 +348,9 @@ def irr_reconstruct(n, x, permissible_values=[0,1],
             row_counter = row_counter + 1
 
     # system matrix s has full rank - find its invertible submatrix
-    B, rows, condB, solve_B = select_invertible_submatrix_with_solver(s, cond_threshold=1e6, verbose=False)
+    B, rows, condB, solve_B = select_invertible_submatrix_maximize_min_singular(s, verbose=True)
+
+    print(f'for path_{n} we got {(rows>=n).sum()} variable rows')
 
     # now go through all possible choices for adjacency matrix entries
     # that correspond to selected rows whose indices are at least n
